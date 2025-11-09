@@ -1,4 +1,7 @@
 # Final_Product_Capstone
+
+Link to demo video: https://drive.google.com/file/d/10NCNTWTqxIm82Ids1nxYJYpJ9KeC_OtH/view?usp=sharing
+
 Final_Product_Capstone - Mold-Kit  Web App
 Overview
 Mold-Kit is a web app that uses ML to detect mold from photos of surfaces. Users can upload images, optionally provide context like location, ventilation, and leaks, and instantly get a prediction — helping prevent health issues and structural damage.
