@@ -4,7 +4,7 @@ Link to demo video: https://drive.google.com/file/d/10NCNTWTqxIm82Ids1nxYJYpJ9Ke
 
 Final_Product_Capstone - Mold-Kit  Web App
 Overview
-Mold-Kit is a web app that uses ML to detect mold from photos of surfaces. Users can upload images, optionally provide context like location, ventilation, and leaks, and instantly get a prediction — helping prevent health issues and structural damage.
+Mold-Kit is a web app that uses ML to detect mold from photos of surfaces. Users can upload images, provide context like location, ventilation, and leaks, and instantly get a prediction — helping prevent health issues and structural damage.
 The project is divided into two main components:
 - Frontend: Hosted on Netlify for a responsive, user-friendly interface accessible on desktop and mobile devices.
 - Backend: Hosted on Render, built with FastAPI and TensorFlow for real-time  predictions.
