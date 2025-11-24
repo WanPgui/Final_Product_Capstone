@@ -1,4 +1,4 @@
-# app.py (UPDATED — Render-forwarding predict route)
+# app.py (UPDATED)
 import os
 import secrets
 import sqlite3
@@ -19,17 +19,18 @@ from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from PIL import Image
 import numpy as np
+import tensorflow as tf
 import pandas as pd
 import requests
+from tensorflow.keras.models import load_model
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 from dotenv import load_dotenv
 
 # load .env
 load_dotenv()
 
-# --- External services config ---
+# --- OpenWeather API Key ---
 OPENWEATHER_API_KEY = os.environ.get("OPENWEATHER_API_KEY")
-# Render API endpoint to forward prediction requests to
-RENDER_API_URL = os.environ.get("RENDER_API_URL", "https://mold-kit.onrender.com/predict")
 
 # -----------------------
 # Create Flask App
@@ -42,7 +43,7 @@ app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 DB_PATH = os.path.join(BASE_DIR, "database.db")  # single canonical DB path
-MODEL_PATH = os.path.join(BASE_DIR, "models", "mold_model_final.keras")  # kept but not required by Render flow
+MODEL_PATH = os.path.join(BASE_DIR, "models", "mold_model_final.keras")
 ALLOWED_EXT = {"png", "jpg", "jpeg", "bmp"}
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "ChangeThisAdminPass!")
 
@@ -70,21 +71,18 @@ app.config.update(
 )
 
 # -----------------------
-# Optional local model loading (kept for compatibility)
+# Model loading
 # -----------------------
 MODEL = None
-try:
-    # only attempt load if file exists
-    if os.path.exists(app.config["MODEL_PATH"]):
-        # NOTE: local model not required for Render API flow
-        from tensorflow.keras.models import load_model
+if os.path.exists(app.config["MODEL_PATH"]):
+    try:
         MODEL = load_model(app.config["MODEL_PATH"], compile=False)
-        print(f"[INFO] Local model loaded from {app.config['MODEL_PATH']}")
-    else:
-        print(f"[INFO] No local model file at {app.config['MODEL_PATH']}; using Render API for predictions.")
-except Exception as e:
-    print(f"[WARN] Could not load local model: {e}")
-    MODEL = None
+        print(f"[INFO] Model loaded from {app.config['MODEL_PATH']}")
+    except Exception as e:
+        print(f"[ERROR] Could not load model: {e}")
+        MODEL = None
+else:
+    print(f"[WARNING] Model file not found at {app.config['MODEL_PATH']}")
 
 # -----------------------
 # Database helpers
@@ -170,10 +168,12 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config["ALLOWED_EXT"]
 
 def log_action(action, user_id=None, extra=None):
+    # Basic logging for audit trail - can be extended to DB table
     ts = datetime.utcnow().isoformat()
     logging.info(f"[{ts}] ACTION={action} USER={user_id} EXTRA={extra}")
 
 def export_csv_bytes():
+    # Export uploads table to CSV bytes
     conn = get_db_conn()
     df = pd.read_sql_query("SELECT * FROM uploads ORDER BY uploaded_at DESC", conn)
     conn.close()
@@ -240,26 +240,30 @@ def set_user_password(user_id, new_password):
     conn.close()
 
 # -----------------------
-# Local prediction helper (kept for compatibility, not used by Render-forward route)
+# Prediction helpers
 # -----------------------
 def predict_image_fullpath(path):
     """
-    Predict if the image at `path` contains mold or not — local fallback.
+    Predict if the image at `path` contains mold or not.
     Returns: (label:str, confidence:float, confidence_display:str)
+    Label is 'mold' or 'no mold'
     """
     try:
         img = Image.open(path).convert("RGB")
         IMG_SIZE = (224, 224)
         img = img.resize(IMG_SIZE, Image.Resampling.LANCZOS)
         arr = np.array(img, dtype=np.float32) / 255.0
+
         if arr.ndim == 2:
             arr = np.stack([arr]*3, axis=-1)
         elif arr.shape[-1] != 3:
             arr = arr[:, :, :3]
+
         arr = np.expand_dims(arr, axis=0)
 
         if MODEL is not None:
             pred = MODEL.predict(arr, verbose=0).flatten()
+            # Assume single-output sigmoid: pred[0] is probability of mold
             score = float(np.clip(pred[0], 0.0, 1.0))
             label = "mold" if score >= 0.5 else "no mold"
             confidence_float = score if label == "mold" else (1 - score)
@@ -277,16 +281,23 @@ def predict_image_fullpath(path):
         print(f"[ERROR] Prediction failed for {path}: {e}")
         return "unknown", 0.0, "0.00%"
 
-# -----------------------
-# Risk assessment & saving helpers
-# -----------------------
 def assess_risk_and_note(label, risk_score, humidity=None, ventilation="moderate", leak="no", health="no"):
+    """
+    Determine final_status and helpful note.
+    - label: 'mold' or 'no mold'
+    - if label == 'no mold' but risk_score high -> note about imminent risk
+    """
+    # final_status logic: high/moderate/safe
     if label == "mold":
-        final_status = "high" if risk_score >= 3 else "moderate"
-    else:
+        if risk_score >= 3:
+            final_status = "high"
+        else:
+            final_status = "moderate"
+    else:  # 'no mold'
         final_status = "safe" if risk_score <= 2 else "high"
 
     note = ""
+    # if predicted no mold but environmental data suggests high risk -> warn
     if label == "no mold":
         imminent_conditions = (risk_score >= 3) or (humidity is not None and humidity > 70) or (ventilation == "poor") or (leak == "yes")
         if imminent_conditions:
@@ -294,10 +305,12 @@ def assess_risk_and_note(label, risk_score, humidity=None, ventilation="moderate
                 "Prediction: no mold detected, but environmental conditions favor mold growth "
                 "(high humidity/poor ventilation/leaks). Risk is imminent — check back and re-inspect."
             )
+
     return final_status, note
 
 def save_prediction(filename, prediction, confidence, location, weather, status, user_id,
                     ventilation="moderate", leak="no", health="no", notes=""):
+    """Save a prediction record with environmental info."""
     conn = get_db_conn()
     c = conn.cursor()
     c.execute("""
@@ -313,6 +326,10 @@ def save_prediction(filename, prediction, confidence, location, weather, status,
     log_action("prediction_saved", user_id=user_id, extra=f"{filename} label={prediction} status={status}")
 
 def add_record(filename, prediction, confidence, user_id=None, **kwargs):
+    """
+    Backwards-compatible wrapper used in older parts of app.
+    kwargs can include ventilation, leak, health, location, weather, status, notes
+    """
     save_prediction(
         filename=filename,
         prediction=prediction,
@@ -407,12 +424,13 @@ def index():
         save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
         file.save(save_path)
 
-        # If you want local prediction here, call predict_image_fullpath(save_path)
         label, confidence_float, conf_display = predict_image_fullpath(save_path)
 
+        # simple status and notes using default (no env provided here)
         final_status = "high" if label == "mold" else "safe"
         notes = ""
         if label == "no mold":
+            # cannot compute risk here without env - keep simple
             notes = "No mold detected on image upload."
 
         add_record(filename, label, confidence_float, user_id=session["user_id"], status=final_status, notes=notes)
@@ -429,7 +447,7 @@ def index():
     return render_template("index.html", recent=recent_uploads, metrics=metrics, email=session.get("email"))
 
 # -----------------------
-# Predict route (FORWARDS to Render API)
+# Predict route (main)
 # -----------------------
 @app.route("/predict", methods=["GET", "POST"])
 @login_required
@@ -438,133 +456,42 @@ def predict():
         return render_template("predict.html")
 
     is_ajax = request.is_json or request.headers.get("X-Requested-With") == "XMLHttpRequest"
+
     try:
-        # --- 1. Validate file presence & type ---
+        # --- 1. IMAGE FILE ---
         file = request.files.get("file")
         if not file or not allowed_file(file.filename):
-            msg = {"error": "Please upload a valid image (png/jpg/jpeg/bmp)."}
+            msg = {"error": "Please upload a valid image (png/jpg/jpeg)"}
             return (jsonify(msg), 400) if is_ajax else redirect(url_for("predict"))
 
-        # Prepare clean filename and save locally
+        # Save clean filename
         timestamp = int(datetime.utcnow().timestamp())
         ext = secure_filename(file.filename).split(".")[-1].lower()
         filename = f"{timestamp}.{ext}"
         save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
 
-        # Normalize image to RGB and expected size (so Render receives consistent images)
+        # Ensure image is RGB and resized
         img = Image.open(file).convert("RGB")
         img = img.resize((224, 224), Image.Resampling.LANCZOS)
         img.save(save_path)
 
-        # --- 2. Forward the file to Render API ---
-        try:
-            with open(save_path, "rb") as fh:
-                files = {"file": (filename, fh, f"image/{ext if ext!='jpg' else 'jpeg'}")}
-                # optional: you can pass extra form data if your Render API expects it
-                resp = requests.post(RENDER_API_URL, files=files, timeout=20)
-        except Exception as e:
-            print(f"[ERROR] Failed to call Render API: {e}")
-            if is_ajax:
-                return jsonify({"error": "Failed to contact prediction service", "details": str(e)}), 502
-            flash("Prediction service unavailable.", "danger")
-            return redirect(url_for("predict"))
+        # --- 2. RUN MODEL PREDICTION ---
+        label, conf_float, conf_display = predict_image_fullpath(save_path)
 
-        # --- 3. Handle Render response ---
-        if resp.status_code != 200:
-            # try to extract message
-            txt = resp.text
-            print(f"[RENDER ERROR] status={resp.status_code} body={txt}")
-            if is_ajax:
-                return jsonify({"error": "Prediction service returned an error", "details": txt}), resp.status_code
-            flash("Prediction service returned an error.", "danger")
-            return redirect(url_for("predict"))
-
-        try:
-            j = resp.json()
-        except Exception as e:
-            print(f"[ERROR] Could not parse Render JSON: {e} -- body: {resp.text}")
-            if is_ajax:
-                return jsonify({"error": "Invalid response from prediction service"}), 502
-            flash("Invalid response from prediction service.", "danger")
-            return redirect(url_for("predict"))
-
-        # Expected shape: {'prediction': 'mold'|'no mold', 'confidence': 0.92, ...}
-        # be defensive and map keys
-        label = None
-        confidence_float = None
-        # common keys to check
-        for k in ("prediction", "label", "result"):
-            if k in j:
-                label = j.get(k)
-                break
-        # confidence possibilities
-        for k in ("confidence", "score", "probability", "prob"):
-            if k in j:
-                try:
-                    confidence_float = float(j.get(k))
-                except:
-                    confidence_float = None
-                break
-
-        # If label is nested or nonstandard, try other heuristics
-        if not label:
-            # try top-level first value if it's simple dict
-            if isinstance(j, dict) and len(j) == 1:
-                label = list(j.values())[0]
-
-        # ensure label is normalized
-        if isinstance(label, str):
-            label = label.strip().lower()
-            if label in ("positive", "mold", "mould", "1", "true", "yes"):
-                label = "mold"
-            elif label in ("negative", "no mold", "no_mold", "clean", "0", "false", "no"):
-                label = "no mold"
-            else:
-                # leave as-is if unknown
-                pass
-        else:
+        # Ensure label is always mold / no mold
+        if label not in ["mold", "no mold"]:
             label = "unknown"
 
-        # confidence fallback formatting
-        if confidence_float is None:
-            # try to derive from probability-like nested keys
-            confidence_float = None
-            if isinstance(j, dict):
-                # search recursively for numeric values
-                def find_first_number(d):
-                    if isinstance(d, dict):
-                        for v in d.values():
-                            if isinstance(v, (int, float)):
-                                return float(v)
-                            rv = find_first_number(v)
-                            if rv is not None:
-                                return rv
-                    elif isinstance(d, list):
-                        for item in d:
-                            rv = find_first_number(item)
-                            if rv is not None:
-                                return rv
-                    return None
-                confidence_float = find_first_number(j)
-        if confidence_float is None:
-            # unknown -> 0.0
-            confidence_float = 0.0
-
-        # prepare a human-readable confidence string
-        try:
-            confidence_display = f"{float(confidence_float)*100:.2f}%"
-        except:
-            confidence_display = str(confidence_float)
-
-        # --- 4. Fetch optional environment inputs & weather (same as before) ---
-        location = request.form.get("location", "").strip()
+        # --- 3. ENVIRONMENT INPUTS ---
+        location = request.form.get("location", "")
         ventilation = request.form.get("ventilation", "moderate").lower()
         leak = request.form.get("leak", "no").lower()
         health = request.form.get("health", "no").lower()
 
+        # --- 4. WEATHER ---
         humidity = None
         weather_info = "No location provided"
-        if location and OPENWEATHER_API_KEY:
+        if location:
             try:
                 res = requests.get(
                     "https://api.openweathermap.org/data/2.5/weather",
@@ -573,18 +500,18 @@ def predict():
                 )
                 data = res.json()
                 if res.ok and "main" in data:
-                    humidity = data["main"].get("humidity")
-                    temp = data["main"].get("temp")
+                    humidity = data["main"]["humidity"]
+                    temp = data["main"]["temp"]
                     weather_info = f"{temp}°C, {humidity}% humidity"
                 else:
                     weather_info = "Invalid location"
-            except Exception as e:
-                print(f"[WARN] Weather fetch error: {e}")
-                weather_info = "Weather fetch error"
+            except:
+                weather_info = "Weather fetch failed"
 
-        # --- 5. Risk scoring ---
+        # --- 5. RISK SCORE ---
         ventilation_score = {"poor": 2, "moderate": 1, "good": 0}
         risk_score = ventilation_score.get(ventilation, 1)
+
         if leak == "yes":
             risk_score += 2
         if humidity is not None:
@@ -592,13 +519,15 @@ def predict():
         if health == "yes":
             risk_score += 1
 
-        final_status, note = assess_risk_and_note(label, risk_score, humidity, ventilation, leak, health)
+        final_status, note = assess_risk_and_note(
+            label, risk_score, humidity, ventilation, leak, health
+        )
 
-        # --- 6. Persist result to DB ---
+        # --- 6. SAVE RECORD ---
         save_prediction(
             filename=filename,
             prediction=label,
-            confidence=float(confidence_float),
+            confidence=conf_float,
             location=location or "Unknown",
             weather=weather_info,
             status=final_status,
@@ -609,17 +538,16 @@ def predict():
             notes=note
         )
 
-        # --- 7. Return response ---
+        # --- 7. RESPONSE ---
         if is_ajax:
             return jsonify({
                 "success": True,
                 "filename": filename,
                 "prediction": label,
-                "confidence": confidence_display,
+                "confidence": conf_display,
                 "status": final_status,
                 "weather": weather_info,
-                "note": note,
-                "raw_render_response": j
+                "note": note
             })
 
         return redirect(url_for("result_page", filename=filename))
@@ -631,8 +559,9 @@ def predict():
         flash("Prediction failed.", "danger")
         return redirect(url_for("predict"))
 
+
 # -----------------------
-# Result page and remaining routes (unchanged)
+# Result page
 # -----------------------
 @app.route("/result")
 @login_required
@@ -783,7 +712,7 @@ def admin_login():
     return render_template("admin_login.html")
 
 # -----------------------
-# Other routes (profile, admin, etc.)
+# Other routes (profile, admin, etc.) - minimal adjustments to use implemented helpers
 # -----------------------
 @app.route("/logout")
 def logout():
@@ -824,6 +753,7 @@ def profile():
     user_info = {"email": user_row["email"], "role": user_row["role"], "last_login": user_row["last_login"]}
     return render_template("profile_tabs.html", user=user_info, uploads=user_uploads)
 
+# Admin pages
 @app.route("/admin/dashboard")
 @admin_required
 def admin_dashboard():
@@ -889,11 +819,12 @@ def contact():
         name = request.form.get("name")
         email = request.form.get("email")
         message = request.form.get("message")
+        # optionally save contact to DB
         flash("Message sent successfully!", "success")
         return redirect(url_for("contact"))
     return render_template("contact.html", title="Contact Us")
 
-# Password reset & verify
+# Password reset & verify (kept compatible with created tables)
 @app.route("/forgot", methods=["GET", "POST"])
 def forgot_password():
     if request.method == "POST":
@@ -912,6 +843,7 @@ def forgot_password():
         conn.close()
         reset_url = url_for('reset_password', token=token, _external=True)
         html_body = f"<p>Reset your password: <a href='{reset_url}'>{reset_url}</a></p>"
+        # try to send email if configured - ignore exceptions
         try:
             send_email(email, "Password Reset Request", html_body)
         except Exception as e:
@@ -997,3 +929,4 @@ def send_email(to_email, subject, html_body):
 # -----------------------
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
+ 
