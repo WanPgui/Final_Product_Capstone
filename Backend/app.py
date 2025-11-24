@@ -458,41 +458,39 @@ def predict():
     is_ajax = request.is_json or request.headers.get("X-Requested-With") == "XMLHttpRequest"
 
     try:
+        # --- 1. IMAGE FILE ---
         file = request.files.get("file")
         if not file or not allowed_file(file.filename):
-            err = {"error": "No valid image uploaded"}
-            return (jsonify(err), 400) if is_ajax else redirect(url_for("predict"))
+            msg = {"error": "Please upload a valid image (png/jpg/jpeg)"}
+            return (jsonify(msg), 400) if is_ajax else redirect(url_for("predict"))
 
-        # process image
+        # Save clean filename
+        timestamp = int(datetime.utcnow().timestamp())
+        ext = secure_filename(file.filename).split(".")[-1].lower()
+        filename = f"{timestamp}.{ext}"
+        save_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+
+        # Ensure image is RGB and resized
         img = Image.open(file).convert("RGB")
-        IMG_SIZE = (224, 224)
-        img = img.resize(IMG_SIZE, Image.Resampling.LANCZOS)
-        arr = np.array(img, dtype=np.uint8)
-        if arr.ndim == 2:
-            arr = np.stack([arr]*3, axis=-1)
-        elif arr.shape[-1] != 3:
-            arr = arr[:, :, :3]
-        img = Image.fromarray(arr)
-
-        # save
-        filename = secure_filename(file.filename)
-        ext = filename.rsplit(".", 1)[-1].lower()
-        new_filename = f"{int(datetime.utcnow().timestamp())}.{ext}"
-        save_path = os.path.join(app.config["UPLOAD_FOLDER"], new_filename)
+        img = img.resize((224, 224), Image.Resampling.LANCZOS)
         img.save(save_path)
 
-        # predict
+        # --- 2. RUN MODEL PREDICTION ---
         label, conf_float, conf_display = predict_image_fullpath(save_path)
 
-        # environmental metadata
-        location = request.form.get("location", "").strip()
+        # Ensure label is always mold / no mold
+        if label not in ["mold", "no mold"]:
+            label = "unknown"
+
+        # --- 3. ENVIRONMENT INPUTS ---
+        location = request.form.get("location", "")
         ventilation = request.form.get("ventilation", "moderate").lower()
         leak = request.form.get("leak", "no").lower()
         health = request.form.get("health", "no").lower()
 
-        # fetch weather (optional)
+        # --- 4. WEATHER ---
         humidity = None
-        weather_data = "No location provided"
+        weather_info = "No location provided"
         if location:
             try:
                 res = requests.get(
@@ -502,18 +500,18 @@ def predict():
                 )
                 data = res.json()
                 if res.ok and "main" in data:
-                    temperature = data["main"].get("temp")
-                    humidity = data["main"].get("humidity")
-                    weather_data = f"{temperature}°C, {humidity}% humidity"
+                    humidity = data["main"]["humidity"]
+                    temp = data["main"]["temp"]
+                    weather_info = f"{temp}°C, {humidity}% humidity"
                 else:
-                    weather_data = "Invalid location"
-            except Exception as ex:
-                print(f"[WARN] Weather fetch error: {ex}")
-                weather_data = "Weather fetch error"
+                    weather_info = "Invalid location"
+            except:
+                weather_info = "Weather fetch failed"
 
-        # risk score calculation (same logic you used)
-        ventilation_risk = {"poor": 2, "moderate": 1, "good": 0}
-        risk_score = ventilation_risk.get(ventilation, 1)
+        # --- 5. RISK SCORE ---
+        ventilation_score = {"poor": 2, "moderate": 1, "good": 0}
+        risk_score = ventilation_score.get(ventilation, 1)
+
         if leak == "yes":
             risk_score += 2
         if humidity is not None:
@@ -521,15 +519,17 @@ def predict():
         if health == "yes":
             risk_score += 1
 
-        final_status, note = assess_risk_and_note(label, risk_score, humidity, ventilation, leak, health)
+        final_status, note = assess_risk_and_note(
+            label, risk_score, humidity, ventilation, leak, health
+        )
 
-        # save prediction (including notes if any)
+        # --- 6. SAVE RECORD ---
         save_prediction(
-            filename=new_filename,
+            filename=filename,
             prediction=label,
             confidence=conf_float,
             location=location or "Unknown",
-            weather=weather_data,
+            weather=weather_info,
             status=final_status,
             user_id=session.get("user_id"),
             ventilation=ventilation,
@@ -538,26 +538,27 @@ def predict():
             notes=note
         )
 
-        # return AJAX or redirect
+        # --- 7. RESPONSE ---
         if is_ajax:
             return jsonify({
                 "success": True,
-                "filename": new_filename,
+                "filename": filename,
                 "prediction": label,
                 "confidence": conf_display,
                 "status": final_status,
-                "weather": weather_data,
+                "weather": weather_info,
                 "note": note
             })
 
-        return redirect(url_for("result_page", filename=new_filename))
+        return redirect(url_for("result_page", filename=filename))
 
     except Exception as e:
-        print(f"[ERROR] Prediction failed: {e}")
+        print(f"[PREDICT ERROR] {e}")
         if is_ajax:
             return jsonify({"error": "Prediction failed", "details": str(e)}), 500
         flash("Prediction failed.", "danger")
         return redirect(url_for("predict"))
+
 
 # -----------------------
 # Result page
