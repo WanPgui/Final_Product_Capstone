@@ -1,4 +1,9 @@
-1. Project Title
+Final Capstone Project Submission -  Mold-Kit Web App
+Student Name: Peris Wangui
+ Supervisor Name: Samiratu Ntohsi
+ Date: December 1, 2025
+ 
+ 1. Project Title
 Mold-Kit: A Machine Learning-Powered Web Application for Mold Detection
 
 2. Project Repository & Demo Links
